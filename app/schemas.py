@@ -89,6 +89,35 @@ class PolicyUpsert(BaseModel):
     )
 
 
+# --------------------------------------------------------------------------- #
+# Policy change impact preview
+# --------------------------------------------------------------------------- #
+
+
+class ImpactRequest(BaseModel):
+    """Body of POST /policies/{name}/impact: candidate rules + sample docs.
+
+    The candidate rules are evaluated against the samples but never persisted;
+    the stored policy is read once, atomically, and left untouched.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rules: List[RuleSpec] = Field(
+        ...,
+        description=(
+            "Candidate rule set to preview against the currently committed "
+            "policy. May be empty (previewing removal of every rule)."
+        ),
+    )
+    samples: List[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="One to twenty arbitrary JSON documents run through both rule sets.",
+    )
+
+
 class RuleRef(BaseModel):
     index: int = Field(..., description="Zero-based declaration index within the effective rules.")
     pointer: str
@@ -133,6 +162,58 @@ class PolicySnapshot(BaseModel):
     rules: List[RuleSpec]
     etag: str = Field(..., description="Opaque, version-specific validator (also an ETag).")
     created_at: str = Field(..., description="UTC ISO-8601 creation timestamp.")
+
+
+class ImpactBaseline(BaseModel):
+    """The currently committed policy the candidate is compared against."""
+
+    name: str
+    version: int = Field(..., description="Concrete version resolved by the atomic read.")
+    etag: str = Field(..., description="ETag of that baseline version (use it to PUT the change).")
+
+
+class ImpactAction(BaseModel):
+    """One effective action recorded in an audit: pointer plus winning rule."""
+
+    pointer: str = Field(..., description="JSON Pointer of the node on the ORIGINAL sample.")
+    action: Action
+    rule: RuleRef
+
+
+class ImpactChange(BaseModel):
+    """A pointer acted on in both runs, but with a different effective action."""
+
+    pointer: str
+    before: ImpactAction = Field(..., description="Effective action under the current policy.")
+    after: ImpactAction = Field(..., description="Effective action under the candidate rules.")
+
+
+class SampleImpact(BaseModel):
+    index: int = Field(..., description="Zero-based position of the sample in the request.")
+    added: List[ImpactAction] = Field(
+        ..., description="Pointers the candidate starts acting on (in candidate audit order)."
+    )
+    removed: List[ImpactAction] = Field(
+        ..., description="Pointers the candidate stops acting on (in current audit order)."
+    )
+    changed: List[ImpactChange] = Field(
+        ..., description="Pointers whose effective action differs between the two runs."
+    )
+
+
+class ImpactSummary(BaseModel):
+    """Totals across every sample (each effective action counted once)."""
+
+    samples: int
+    added: int
+    removed: int
+    changed: int
+
+
+class ImpactResponse(BaseModel):
+    baseline: ImpactBaseline
+    samples: List[SampleImpact]
+    summary: ImpactSummary
 
 
 def compile_specs(rules: List[RuleSpec]):

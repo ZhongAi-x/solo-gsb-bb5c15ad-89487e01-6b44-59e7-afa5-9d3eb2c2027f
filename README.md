@@ -17,6 +17,7 @@ docker compose up --build
 服务在 <http://localhost:8080> 就绪：
 
 - `POST /redact` — 脱敏接口（内联规则或引用策略，二选一）
+- `POST /policies/{name}/impact` — 策略变更影响预览（候选规则 vs 当前版本，不创建新版本）
 - `PUT  /policies/{name}` — 创建/更新策略（ETag 乐观并发控制）
 - `GET  /policies/{name}` — 查询策略最新版本
 - `GET  /policies/{name}/versions/{version}` — 查询不可变历史快照
@@ -138,6 +139,84 @@ curl -s http://localhost:8080/policies/pii-basic/versions/1      # 指定历史�
 
 策略名限 `[A-Za-z0-9]` 开头，可含 `.` `_` `-`，长度 1–64。
 
+## 策略变更影响预览（`POST /policies/{name}/impact`）
+
+更新策略前，用候选规则在一批样本文档上**预演**变更效果。服务只**原子读取一次**
+当前最新版本并与之比较，**不会创建新版本、不写库**；返回基准策略版本、逐样本差异
+与汇总计数，可据此决定是否携带返回的 `baseline.etag` 发起 `PUT`。
+
+请求体：
+
+```json
+{
+  "rules": [
+    {"pointer": "/users/*/email", "action": "sha256"},
+    {"pointer": "/users/*/password", "action": "remove"}
+  ],
+  "samples": [
+    {"users": [{"email": "a@x.io", "password": "p"}]}
+  ]
+}
+```
+
+- `rules`：候选规则全集（允许空数组，相当于预览“删除全部规则”）；
+- `samples`：**1～20** 个任意 JSON（也可以是标量、数组、`null`）；
+- 候选规则非法（指针语法错、动作非法）→ `422`；样本数不在 1～20 → `422`；
+  策略不存在 → `404`。
+
+响应体：
+
+```json
+{
+  "baseline": {"name": "pii", "version": 2, "etag": "\"8413...\""},
+  "samples": [
+    {
+      "index": 0,
+      "added": [
+        {
+          "pointer": "/users/0/password",
+          "action": "remove",
+          "rule": {"index": 1, "pointer": "/users/*/password", "action": "remove"}
+        }
+      ],
+      "removed": [],
+      "changed": [
+        {
+          "pointer": "/users/0/email",
+          "before": {"pointer": "/users/0/email", "action": "mask",
+                     "rule": {"index": 0, "pointer": "/users/*/email", "action": "mask"}},
+          "after": {"pointer": "/users/0/email", "action": "sha256",
+                    "rule": {"index": 0, "pointer": "/users/*/email", "action": "sha256"}}
+        }
+      ]
+    }
+  ],
+  "summary": {"samples": 1, "added": 1, "removed": 0, "changed": 1}
+}
+```
+
+三类差异都以节点在**原始样本**上的 JSON Pointer 为键，比较的是两次审计中的
+**实际生效动作**（每条都带生效规则 `rule`）：
+
+| 类别 | 含义 |
+| --- | --- |
+| `added` | 仅候选规则在该指针产生动作（新增脱敏点），按候选审计顺序排列 |
+| `removed` | 仅当前规则在该指针产生动作（候选将停止处理），按当前审计顺序排列 |
+| `changed` | 两次都处理同一指针，但生效动作不同；`before`/`after` 各记一条生效动作 |
+
+两点关键语义由此自动得到正确处理：
+
+- **父节点整体动作的后代短路**：当一个节点被子树规则整体 mask/remove/sha256 时，
+  后代不会出现在审计里。例如当前 `/card/number`、`/card/cvv` 分别 mask，候选改为
+  `/card` 整体 remove，差异就是两个 `removed` 叶子 + 一个 `added` `/card`，
+  不会产生一堆虚假的后代差异；
+- **数组删除后的下标稳定性**：两次匹配都基于原始样本一次性计算，指针中的数组下标
+  始终指原始位置。例如两套规则都 remove `/items/0`，候选再对 `/items/*/v` mask，
+  新增差异为 `/items/1/v`、`/items/2/v`——删除第 0 个元素不会让后续下标错位。
+
+同一指针的生效动作相同则**不计差异**，即使生效规则的声明下标或名称变了
+（例如只是规则重排），因为最终脱敏行为没有变化。
+
 ## 请求 / 响应
 
 ### 规则来源：内联 rules 与 policy 引用二选一
@@ -253,8 +332,8 @@ python -m pytest -q
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用：/redact、/policies 路由
-│   ├── redaction.py     # 核心引擎：pointer 解析、通配匹配、冲突裁决、动作执行
+│   ├── main.py          # FastAPI 应用：/redact、/policies、/policies/{name}/impact 路由
+│   ├── redaction.py     # 核心引擎：pointer 解析、通配匹配、冲突裁决、动作执行、审计差异
 │   ├── policy_store.py  # SQLite 版本化策略库：ETag 乐观锁、不可变版本、原子读取
 │   ├── schemas.py       # 请求/响应 Pydantic 模型
 │   └── config.py        # REDACT_SALT / POLICY_DB 环境变量
@@ -262,7 +341,8 @@ python -m pytest -q
 │   ├── conftest.py      # 每测例一个临时 SQLite 库
 │   ├── test_engine.py   # 引擎单元测试（通配、优先级、数组稳定性、根节点等）
 │   ├── test_api.py      # /redact HTTP 层集成测试
-│   └── test_policies.py # 策略库测试：ETag 生命周期、并发更新、历史复现
+│   ├── test_policies.py # 策略库测试：ETag 生命周期、并发更新、历史复现
+│   └── test_impact.py   # 影响预览测试：added/removed/changed、短路、下标稳定性、404/422
 ├── Dockerfile           # 内置 /data 卷点（nobody 可写）
 ├── docker-compose.yml   # 命名卷 policy-data -> /data，8080 端口
 └── requirements.txt

@@ -188,6 +188,55 @@ def sha256_value(value: Any, salt: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Audit comparison (policy change impact preview)
+# --------------------------------------------------------------------------- #
+
+
+def diff_audits(
+    current: List[Dict[str, Any]], candidate: List[Dict[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Compare two audits of the SAME document by their effective actions.
+
+    Both trails are produced by :func:`redact` against one unmodified input,
+    so their pointers already embody the two properties the comparison relies
+    on:
+
+    * **ancestor short-circuit** -- when a matched parent owns a subtree
+      (mask/remove/sha256), no descendant appears in the audit, so switching
+      a parent-level rule on or off shows up as a single added/removed action
+      rather than as noise on every descendant;
+    * **original array indices** -- all matching is computed up front on the
+      original list, so deletions never shift later pointers and the same
+      index means the same element in both audits.
+
+    Pointers are therefore directly comparable between the two runs:
+
+    * only in ``candidate`` -> ``added``;
+    * only in ``current``   -> ``removed``;
+    * present in both with a different effective action -> ``changed``.
+
+    A pointer whose effective action is identical is never reported, even if
+    the winning rule itself changed (e.g. only its declaration index moved).
+    """
+    current_map = {entry["pointer"]: entry for entry in current}
+    candidate_map = {entry["pointer"]: entry for entry in candidate}
+
+    added = [entry for entry in candidate if entry["pointer"] not in current_map]
+    removed = [entry for entry in current if entry["pointer"] not in candidate_map]
+    changed = [
+        {
+            "pointer": entry["pointer"],
+            "before": entry,
+            "after": candidate_map[entry["pointer"]],
+        }
+        for entry in current
+        if entry["pointer"] in candidate_map
+        and entry["action"] != candidate_map[entry["pointer"]]["action"]
+    ]
+    return {"added": added, "removed": removed, "changed": changed}
+
+
+# --------------------------------------------------------------------------- #
 # Application
 # --------------------------------------------------------------------------- #
 

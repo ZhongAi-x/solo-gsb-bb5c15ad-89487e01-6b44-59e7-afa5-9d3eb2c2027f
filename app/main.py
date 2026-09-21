@@ -10,9 +10,11 @@ from fastapi import FastAPI, Header, HTTPException, Path, status
 from fastapi.responses import JSONResponse
 
 from . import config, policy_store
-from .redaction import redact
+from .redaction import diff_audits, redact
 from .schemas import (
     NAME_PATTERN,
+    ImpactRequest,
+    ImpactResponse,
     PolicySnapshot,
     PolicyUpsert,
     RedactRequest,
@@ -34,7 +36,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="JSON Redaction API",
-    version="2.0.0",
+    version="2.1.0",
     description=(
         "Redact arbitrary JSON using JSON Pointer rules with * / ** globs. "
         "Rule sets can be supplied inline or referenced from an immutable, "
@@ -194,6 +196,67 @@ def get_policy_version(name: PolicyName, version: PolicyVersion) -> JSONResponse
             detail=f"policy {name!r} version {version} not found",
         )
     return _snapshot_response(snapshot, status.HTTP_200_OK)
+
+
+# --------------------------------------------------------------------------- #
+# Policy change impact preview
+# --------------------------------------------------------------------------- #
+
+
+@app.post(
+    "/policies/{name}/impact",
+    tags=["policies"],
+    response_model=ImpactResponse,
+    summary=(
+        "Preview how candidate rules would change redaction on sample "
+        "documents, without creating a new policy version."
+    ),
+    responses={
+        404: {"description": "Policy does not exist."},
+        422: {"description": "Invalid candidate rules, or fewer than 1 / more than 20 samples."},
+    },
+)
+def policy_impact(name: PolicyName, body: ImpactRequest) -> JSONResponse:
+    # One atomic read of the newest committed version; the preview never
+    # writes, so no policy version is created or mutated.
+    try:
+        snapshot = policy_store.get_current(name)
+    except policy_store.PolicyNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "policy_not_found", "name": name},
+        )
+
+    current_rules = compile_specs(
+        [RuleSpec.model_validate(item) for item in snapshot["rules"]]
+    )
+    candidate_rules = compile_specs(body.rules)
+    salt = config.get_salt()
+
+    sample_results = []
+    totals = {"added": 0, "removed": 0, "changed": 0}
+    for index, sample in enumerate(body.samples):
+        # Both runs match against the SAME unmodified sample, so the audits'
+        # pointers (original indices, ancestor short-circuit) are directly
+        # comparable. Redacted outputs are discarded; only actions matter.
+        _, current_audit = redact(sample, current_rules, salt=salt)
+        _, candidate_audit = redact(sample, candidate_rules, salt=salt)
+        diff = diff_audits(current_audit, candidate_audit)
+        sample_results.append({"index": index, **diff})
+        for key in totals:
+            totals[key] += len(diff[key])
+
+    return JSONResponse(
+        {
+            "baseline": {
+                "name": snapshot["name"],
+                "version": snapshot["version"],
+                "etag": snapshot["etag"],
+            },
+            "samples": sample_results,
+            "summary": {"samples": len(body.samples), **totals},
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #
