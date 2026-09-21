@@ -10,9 +10,12 @@ from fastapi import FastAPI, Header, HTTPException, Path, status
 from fastapi.responses import JSONResponse
 
 from . import config, policy_store
+from . import impact as impact_preview
 from .redaction import redact
 from .schemas import (
     NAME_PATTERN,
+    ImpactRequest,
+    ImpactResponse,
     PolicySnapshot,
     PolicyUpsert,
     RedactRequest,
@@ -194,6 +197,58 @@ def get_policy_version(name: PolicyName, version: PolicyVersion) -> JSONResponse
             detail=f"policy {name!r} version {version} not found",
         )
     return _snapshot_response(snapshot, status.HTTP_200_OK)
+
+
+@app.post(
+    "/policies/{name}/impact",
+    tags=["policies"],
+    response_model=ImpactResponse,
+    summary="Preview the impact of a candidate rule change without creating a version.",
+    responses={
+        404: {"description": "No policy with this name exists."},
+        422: {"description": "Invalid candidate rules, or samples outside the 1..20 range."},
+    },
+)
+def policy_impact(name: PolicyName, body: ImpactRequest) -> JSONResponse:
+    # One atomic read of the newest committed version; this endpoint is purely
+    # a read and never writes a new version.
+    try:
+        snapshot = policy_store.get_current(name)
+    except policy_store.PolicyNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "policy_not_found", "name": name},
+        )
+
+    current_specs = [RuleSpec.model_validate(item) for item in snapshot["rules"]]
+    current_rules = compile_specs(current_specs)
+    candidate_rules = compile_specs(body.rules)
+
+    report = impact_preview.preview_impact(
+        body.samples, current_rules, candidate_rules, salt=config.get_salt()
+    )
+    results = []
+    for index, result in enumerate(report["samples"]):
+        results.append(
+            {
+                "index": index,
+                "diff": result["diff"],
+                "counts": result["counts"],
+                "has_changes": result["has_changes"],
+            }
+        )
+
+    return JSONResponse(
+        {
+            "baseline": {
+                "name": snapshot["name"],
+                "version": snapshot["version"],
+                "etag": snapshot["etag"],
+            },
+            "samples": results,
+            "summary": report["summary"],
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #

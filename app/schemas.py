@@ -135,6 +135,100 @@ class PolicySnapshot(BaseModel):
     created_at: str = Field(..., description="UTC ISO-8601 creation timestamp.")
 
 
+# --------------------------------------------------------------------------- #
+# Policy change impact preview
+# --------------------------------------------------------------------------- #
+
+MAX_IMPACT_SAMPLES = 20
+
+
+class ImpactRequest(BaseModel):
+    """Body of POST /policies/{name}/impact: candidate rules + sample docs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rules: List[RuleSpec] = Field(
+        ...,
+        description=(
+            "Candidate rule set to preview. It is NEVER persisted or used to "
+            "create a new version; the stored policy stays untouched."
+        ),
+    )
+    samples: List[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_IMPACT_SAMPLES,
+        description=(
+            f"1..{MAX_IMPACT_SAMPLES} representative JSON documents; each is "
+            "processed once by the current rules and once by the candidate rules."
+        ),
+    )
+
+
+class ImpactEffect(BaseModel):
+    """One side of an effective-action comparison."""
+
+    action: Action
+    rule: RuleRef
+
+
+class ImpactAdded(BaseModel):
+    pointer: str = Field(..., description="Original-document JSON Pointer newly acted on.")
+    action: Action
+    rule: RuleRef
+
+
+class ImpactRemoved(BaseModel):
+    pointer: str = Field(..., description="Original-document JSON Pointer no longer acted on.")
+    action: Action
+    rule: RuleRef
+
+
+class ImpactChanged(BaseModel):
+    pointer: str = Field(
+        ..., description="Original-document JSON Pointer whose effective action changes."
+    )
+    before: ImpactEffect
+    after: ImpactEffect
+
+
+class ImpactDiff(BaseModel):
+    added: List[ImpactAdded] = Field(default_factory=list)
+    removed: List[ImpactRemoved] = Field(default_factory=list)
+    changed: List[ImpactChanged] = Field(default_factory=list)
+
+
+class ImpactCounts(BaseModel):
+    added: int
+    removed: int
+    changed: int
+
+
+class SampleImpact(BaseModel):
+    index: int = Field(..., description="Zero-based position of the sample in the request.")
+    diff: ImpactDiff
+    counts: ImpactCounts
+    has_changes: bool
+
+
+class ImpactSummary(ImpactCounts):
+    samples: int = Field(..., description="Number of samples compared.")
+
+
+class ImpactBaseline(BaseModel):
+    name: str
+    version: int = Field(
+        ..., description="Concrete current version atomically read for this preview."
+    )
+    etag: str = Field(..., description="ETag of the baseline (current) version.")
+
+
+class ImpactResponse(BaseModel):
+    baseline: ImpactBaseline
+    samples: List[SampleImpact]
+    summary: ImpactSummary
+
+
 def compile_specs(rules: List[RuleSpec]):
     """Turn validated request specs into engine rules."""
     return [

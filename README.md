@@ -20,6 +20,7 @@ docker compose up --build
 - `PUT  /policies/{name}` — 创建/更新策略（ETag 乐观并发控制）
 - `GET  /policies/{name}` — 查询策略最新版本
 - `GET  /policies/{name}/versions/{version}` — 查询不可变历史快照
+- `POST /policies/{name}/impact` — 策略变更影响预览（只读，不产生新版本）
 - `GET  /health` — 健康检查
 - `GET  /docs`   — Swagger UI（可直接在线试用）
 
@@ -138,6 +139,81 @@ curl -s http://localhost:8080/policies/pii-basic/versions/1      # 指定历史�
 
 策略名限 `[A-Za-z0-9]` 开头，可含 `.` `_` `-`，长度 1–64。
 
+## 策略变更影响预览（只读）
+
+修改策略前，可以用 `POST /policies/{name}/impact` 先预览候选规则相对**当前版本**
+会带来哪些差异。接口对当前策略执行一次**原子读取**，**不会创建新版本、不写入任何
+数据**；服务对每个样本分别用当前规则与候选规则各跑一遍脱敏，再对比两次**审计轨迹
+中的实际生效动作**，按原始 JSON Pointer 输出三类差异：
+
+| 类别 | 含义 |
+| --- | --- |
+| `added` | 候选规则下新出现的生效动作（当前规则完全不处理该原始节点） |
+| `removed` | 候选规则下消失的生效动作（当前规则处理、候选规则不再处理） |
+| `changed` | 同一原始 Pointer 在两边都有动作，但**生效动作不同**（如 `mask` → `sha256`） |
+
+对比基于**审计中实际生效的规则**，因此引擎既有的短路与稳定性保证在预览中同样成立：
+
+- **子树短路**：父节点整体 `mask`/`remove`/`sha256` 后，后代不会出现在任何一方的
+  审计里。例如当前对 `/card` 整体 mask，候选即使新增 `/card/cvv` remove，该规则也
+  永远不会生效，预览为空；若候选去掉父规则改为分别处理子节点，则 `/card` 计入
+  `removed`、各子节点计入 `added`。
+- **数组下标稳定**：审计 Pointer 始终指向**原始下标**，候选规则删除数组元素不会让
+  后续下标错位；例如新增 `/items/0` remove，只会报 `/items/0` 新增、`/items/0/v`
+  消失，`/items/1/v`、`/items/2/v` 因两边动作相同而不报。
+- 仅命中规则不同（如两条不同的 `mask` 规则）但**生效动作相同**时不计差异——对文档
+  的外部影响没有变化。
+
+请求体携带候选 `rules`（1～20 个样本放在 `samples`；候选规则本身允许为空，表示
+预览“清空策略”的效果）：
+
+```bash
+curl -s -X POST http://localhost:8080/policies/pii/impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [
+      {"pointer": "/users/*/email", "action": "sha256"},
+      {"pointer": "/users/*/password", "action": "remove"}
+    ],
+    "samples": [
+      {"users": [{"email": "a@x.io", "password": "p", "name": "a"}]}
+    ]
+  }'
+```
+
+响应返回基准策略版本（原子读到的具体 `version` 与 `etag`）、逐样本差异与汇总计数：
+
+```json
+{
+  "baseline": { "name": "pii", "version": 2, "etag": "\"…\"" },
+  "samples": [
+    {
+      "index": 0,
+      "diff": {
+        "added": [
+          { "pointer": "/users/0/password", "action": "remove",
+            "rule": { "index": 1, "pointer": "/users/*/password", "action": "remove" } }
+        ],
+        "removed": [],
+        "changed": [
+          { "pointer": "/users/0/email",
+            "before": { "action": "mask",
+                        "rule": { "index": 0, "pointer": "/users/*/email", "action": "mask" } },
+            "after":  { "action": "sha256",
+                        "rule": { "index": 0, "pointer": "/users/*/email", "action": "sha256" } } }
+        ]
+      },
+      "counts": { "added": 1, "removed": 0, "changed": 1 },
+      "has_changes": true
+    }
+  ],
+  "summary": { "added": 1, "removed": 0, "changed": 1, "samples": 1 }
+}
+```
+
+错误情况：策略不存在 → `404`；样本数量不在 1～20、候选规则的 pointer/action 非法或
+出现多余字段 → `422`。
+
 ## 请求 / 响应
 
 ### 规则来源：内联 rules 与 policy 引用二选一
@@ -253,14 +329,16 @@ python -m pytest -q
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 应用：/redact、/policies 路由
+│   ├── main.py          # FastAPI 应用：/redact、/policies、/impact 路由
 │   ├── redaction.py     # 核心引擎：pointer 解析、通配匹配、冲突裁决、动作执行
+│   ├── impact.py        # 影响预览：两次审计对比 added/removed/changed
 │   ├── policy_store.py  # SQLite 版本化策略库：ETag 乐观锁、不可变版本、原子读取
 │   ├── schemas.py       # 请求/响应 Pydantic 模型
 │   └── config.py        # REDACT_SALT / POLICY_DB 环境变量
 ├── tests/
 │   ├── conftest.py      # 每测例一个临时 SQLite 库
 │   ├── test_engine.py   # 引擎单元测试（通配、优先级、数组稳定性、根节点等）
+│   ├── test_impact.py   # 影响预览测试（短路、下标稳定、逐样本差异、404/422）
 │   ├── test_api.py      # /redact HTTP 层集成测试
 │   └── test_policies.py # 策略库测试：ETag 生命周期、并发更新、历史复现
 ├── Dockerfile           # 内置 /data 卷点（nobody 可写）
